@@ -522,7 +522,7 @@ class AdditionalInputs(QDialog):
             self._reveal_widget(widget)
             CustomMessageBox(
                 title="Error",
-                text=f"Error: The custom value for '{name}' cannot be empty.",
+                text=f"Error: The custom value for '{name}' must be a positive number (cannot be empty or 0).",
                 buttons=["OK"],
                 dialogType=getattr(MessageBoxType, "Error", MessageBoxType.Warning),
             ).exec()
@@ -586,13 +586,15 @@ class AdditionalInputs(QDialog):
         return name
 
     def _is_empty_required(self, line: QLineEdit) -> bool:
-        return (
-            line is not None
-            and line.isEnabled()
-            and not line.isReadOnly()
-            and line.isVisibleTo(self)
-            and not line.text().strip()
-        )
+        if line is None or not line.isEnabled() or line.isReadOnly() or not line.isVisibleTo(self):
+            return False
+        txt = line.text().strip()
+        if not txt:
+            return True
+        try:
+            return float(txt) <= 0.0
+        except ValueError:
+            return True
 
     def _find_empty_custom_fields(self) -> list:
         found, seen = [], set()
