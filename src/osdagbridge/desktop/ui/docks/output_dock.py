@@ -515,7 +515,7 @@ class OutputDock(QWidget):
                 if row < len(col_items):
                     rb = CustomRadioButton(str(col_items[row]))
                     all_rbs.append(rb)
-                    grid.addWidget(rb, row, col, alignment=Qt.AlignCenter)
+                    grid.addWidget(rb, row, col, alignment=Qt.AlignLeft | Qt.AlignVCenter)
     
         outer.addLayout(grid)    
         return outer
