@@ -57,6 +57,7 @@ class AdditionalInputs(QDialog):
  
         # Store all Compute functions to be called at Design
         self._compute_functions = []
+        self.is_modified = False
 
         self.setObjectName("AdditionalInputs")
         self.setMinimumSize(900, 520)
@@ -176,6 +177,7 @@ class AdditionalInputs(QDialog):
         self._enforce_decimal_places(2)
         # Normalize existing numeric text to 2 decimal places for consistent display
         self._normalize_numeric_texts(2)
+        self._track_changes()
 
         # self._print_widget_tree()
 
@@ -245,6 +247,7 @@ class AdditionalInputs(QDialog):
             self.interacted_first = False
             from osdagbridge.core.bridge_types.plate_girder.ui_fields_additional_input import END_CONNECTORS
             UIBuilder.wire_end_connectors(END_CONNECTORS, ai=self)
+        self.is_modified = False
 
     def set_defaults(self) -> None:  # lifecycle: populates all widgets from working_input_dict; called at init time only
         """
@@ -503,6 +506,7 @@ class AdditionalInputs(QDialog):
         for tab_widget in self.findChildren(QTabWidget):
             if hasattr(tab_widget, "refresh_active_tab"):
                 tab_widget.refresh_active_tab()
+        self._track_changes()
 
     # ── Dialog Persistence ───────────────────────────────────────────────────────
 
@@ -512,6 +516,18 @@ class AdditionalInputs(QDialog):
         # _save_stiffener_member_data otherwise only runs when switching *away* from a
         # member (via _on_stiffener_member_load), so the last-viewed girder (e.g. G4)
         # would never be persisted. This gives it the same save the other girders get.
+        empty_fields = self._find_empty_custom_fields()
+        if empty_fields:
+            widget, name = empty_fields[0]
+            self._reveal_widget(widget)
+            CustomMessageBox(
+                title="Error",
+                text=f"Error: The custom value for '{name}' cannot be empty.",
+                buttons=["OK"],
+                dialogType=getattr(MessageBoxType, "Error", MessageBoxType.Warning),
+            ).exec()
+            return
+
         combo = self.findChild(QComboBox, KEY_MP_STIFFENER_SELECT_MEMBER_ID)
         if combo and combo.currentText().strip():
             self._save_stiffener_member_data(combo.currentText().strip())
@@ -522,6 +538,8 @@ class AdditionalInputs(QDialog):
         if cad:
             self.update_template_page_2d_cad.emit(cad.params)
         
+        self.is_modified = False
+
         CustomMessageBox(
             title="Saved",
             text="Inputs saved successfully.",
@@ -537,6 +555,138 @@ class AdditionalInputs(QDialog):
             buttons=["OK"],
             dialogType=MessageBoxType.Warning,
         ).exec()
+    # ── Task II: Custom-field validation & unsaved-changes guard ────────────────
+    _CUSTOM_FIELD_RULES = {
+        KEY_CB_TYPE:           (KEY_CB_DENSITY, KEY_CB_WIDTH, KEY_CB_HEIGHT, KEY_CB_AREA, KEY_CB_LOAD),
+        KEY_MD_TYPE:           (KEY_MD_DENSITY, KEY_MD_WIDTH, KEY_MD_HEIGHT, KEY_MD_AREA, KEY_MD_LOAD),
+        KEY_RL_TYPE:           (KEY_RL_WIDTH, KEY_RL_HEIGHT, KEY_RL_LOAD_VALUE),
+        KEY_RL_LOAD_MODE:      (KEY_RL_LOAD_VALUE,),
+        KEY_WC_MATERIAL:       (KEY_WC_DENSITY,),
+        KEY_SL_DEAD_LOAD_MODE: (KEY_SL_DEAD_LOAD_VALUE,),
+        KEY_SL_LIVE_LOAD_MODE: (KEY_SL_LIVE_LOAD_VALUE,),
+    }
+
+    def _field_display_name(self, widget: QWidget) -> str:
+        key = widget.objectName() or ""
+        lbl = self.findChild(QLabel, key + "_label") if key else None
+        if lbl and lbl.text().strip():
+            name = lbl.text().strip().rstrip(":").strip()
+        elif key:
+            name = key.split(".")[-1].replace("_", " ").title()
+        else:
+            name = "Custom Field"
+
+        p = widget.parentWidget()
+        while p is not None and p is not self:
+            for tw in self.findChildren(QTabWidget):
+                idx = tw.indexOf(p)
+                if idx >= 0:
+                    return f"{name} ({tw.tabText(idx)})"
+            p = p.parentWidget()
+        return name
+
+    def _is_empty_required(self, line: QLineEdit) -> bool:
+        return (
+            line is not None
+            and line.isEnabled()
+            and not line.isReadOnly()
+            and line.isVisibleTo(self)
+            and not line.text().strip()
+        )
+
+    def _find_empty_custom_fields(self) -> list:
+        found, seen = [], set()
+
+        def _add(line):
+            if isinstance(line, QLineEdit) and id(line) not in seen and self._is_empty_required(line):
+                seen.add(id(line))
+                found.append((line, self._field_display_name(line)))
+
+        for combo_key, line_keys in self._CUSTOM_FIELD_RULES.items():
+            combo = self.findChild(QComboBox, combo_key)
+            if combo is None or not combo.isEnabled() or combo.currentText().strip() != "Custom":
+                continue
+            for lk in line_keys:
+                _add(self.findChild(QLineEdit, lk))
+
+        for w in self.findChildren(QWidget):
+            if isinstance(w, (QComboBox, QLineEdit, AdaptiveWidget)) or not w.objectName():
+                continue
+            combos = [c for c in w.children() if isinstance(c, QComboBox)]
+            lines = [l for l in w.children() if isinstance(l, QLineEdit)]
+            if len(combos) == 1 and len(lines) == 1 and combos[0].currentText().strip() == "Custom":
+                line = lines[0]
+                if not line.objectName():
+                    line.setObjectName(w.objectName())
+                _add(line)
+
+        return found
+
+    def _reveal_widget(self, widget: QWidget) -> None:
+        chain, p = [], widget
+        while p is not None and p is not self:
+            chain.append(p)
+            p = p.parentWidget()
+        for tw in self.findChildren(QTabWidget):
+            for ancestor in chain:
+                idx = tw.indexOf(ancestor)
+                if idx >= 0:
+                    tw.setCurrentIndex(idx)
+        widget.setFocus()
+
+    def _mark_modified(self, *_args) -> None:
+        self.is_modified = True
+
+    def _track_changes(self) -> None:
+        for w in self.findChildren(QWidget):
+            if w.property("_ai_tracked"):
+                continue
+            if isinstance(w, QLineEdit):
+                w.textEdited.connect(self._mark_modified)
+            elif isinstance(w, QComboBox):
+                w.activated.connect(self._mark_modified)
+            elif isinstance(w, QCheckBox):
+                w.clicked.connect(self._mark_modified)
+            else:
+                continue
+            w.setProperty("_ai_tracked", True)
+
+    def _revert_unsaved_changes(self) -> None:
+        self.working_input_dict = deepcopy(self.default_input_dict)
+        self.set_defaults()
+        self._update_additional_input_cad()
+        self.is_modified = False
+
+    def _confirm_discard(self) -> bool:
+        if not self.is_modified:
+            return True
+        from PySide6.QtWidgets import QMessageBox
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Unsaved Changes")
+        box.setText(
+            "You have unsaved changes. Closing this window will discard them. "
+            "Do you want to proceed?"
+        )
+        discard = box.addButton("Discard", QMessageBox.DestructiveRole)
+        cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        return box.clickedButton() is discard
+
+    def closeEvent(self, event):
+        if self._confirm_discard():
+            self._revert_unsaved_changes()
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+    def reject(self):
+        if self._confirm_discard():
+            self._revert_unsaved_changes()
+            super().reject()
+
 
     # ── Field Change Handling ────────────────────────────────────────────────────
 
@@ -2888,6 +3038,7 @@ class AdditionalInputs(QDialog):
             else:
                 updated.append(result)
             self._on_field_edited(KEY_LL_CUSTOM_VEHICLES, updated)
+            self.is_modified = True
             if widget:
                 widget.update(updated)
 
@@ -2910,6 +3061,7 @@ class AdditionalInputs(QDialog):
             else:
                 updated.append(result)
             self._on_field_edited(KEY_LC_COMBINATIONS, updated)
+            self.is_modified = True
             if widget:
                 widget.update(updated)
 
