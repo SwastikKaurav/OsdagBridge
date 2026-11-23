@@ -937,3 +937,47 @@ def solve_extend_basic_input_dict(basic_input_dict: dict) -> None:
     # Update Dynamic per-girder/member keys
     _on_no_of_girders_changed(basic_input_dict)
 
+
+def solve_girder_spacing_edit(basic_input_dict: dict, girder_spacing: float) -> dict:
+    """Apply a user-edited girder spacing (m) to an already-solved basic_input_dict.
+
+    Same rule as the Additional Inputs dialog (``update_girder_layout("spacing")``): the girder
+    count stays fixed and the deck overhang is derived from
+    ``overall_width = (n - 1) * spacing + 2 * overhang``.
+
+    Updates girder spacing, deck overhang and overall width in-place and returns the previous
+    values as ``{key: old_value}`` so the caller can report what changed.  Raises ``ValueError``
+    (message ready to show to the user) when the layout is impossible; the dict is then untouched.
+    """
+    from .initial_sizing import BridgeConfigurationSolver
+
+    d = basic_input_dict
+    if d.get(KEY_CARRIAGEWAY_WIDTH) is None or d.get(KEY_TS_NO_OF_GIRDERS) is None:
+        raise ValueError("Enter the Span and Carriageway Width first.")
+
+    railing_width = float(d.get(KEY_RL_WIDTH) or 0.0)
+    if railing_width > 10:      # railing width may be stored in mm by Additional Inputs
+        railing_width /= 1000.0
+
+    solver = BridgeConfigurationSolver(
+        carriageway_width=float(d[KEY_CARRIAGEWAY_WIDTH]),
+        crash_barrier_width=float(d.get(KEY_CB_WIDTH) or 0.0),
+        footpath_width=float(d.get(KEY_TS_FOOTPATH_WIDTH) or 0.0),
+        railing_width=railing_width,
+        median_width=float(d.get(KEY_MD_WIDTH) or 0.0),
+        n_footpaths=int(d.get(KEY_TS_NO_OF_FOOTPATHS) or 0),
+    )
+    result = solver._solve_layout(
+        no_of_girders=int(float(d[KEY_TS_NO_OF_GIRDERS])),
+        girder_spacing=float(girder_spacing),
+        changed_field="spacing",
+    )
+
+    new_values = {
+        KEY_TS_GIRDER_SPACING: result.girder_spacing,
+        KEY_TS_DECK_OVERHANG:  result.deck_overhang,
+        KEY_TS_OVERALL_WIDTH:  result.overall_width,
+    }
+    previous = {key: d.get(key) for key in new_values}
+    d.update(new_values)
+    return previous

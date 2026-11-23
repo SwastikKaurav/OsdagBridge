@@ -14,6 +14,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QRectF, QRect
 from PySide6.QtGui import QColor, QPainterPath, QPen, QFontMetrics, QIcon, QCursor
 from osdagbridge.desktop.ui.utils.custom_cursors import pointing_hand_cursor
+from PySide6.QtWidgets import QLineEdit, QToolTip
+from PySide6.QtCore import Signal, QRegularExpression
+from PySide6.QtGui import QRegularExpressionValidator
 
 # =================================================================================
 #   ITEM DELEGATE FOR DISABLED ITEMS
@@ -664,6 +667,165 @@ class ToolBarWidget(QWidget):
 
         main_layout.addWidget(self.scroll_area)
  
+
+#---------Inline label editing for QPainter-drawn CAD canvases--------------------------------
+class CADLabelEditor(QLineEdit):
+    """Temporary line-edit that replaces a painted CAD label while it is being edited.
+
+    Enter, or a click outside the box, commits the typed text; Esc cancels.
+    Exactly one of ``committed`` / ``cancelled`` is emitted per edit session.
+    """
+
+    committed = Signal(str, str)   # (parameter key, typed text)
+    cancelled = Signal()
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self._key = None
+        self._active = False
+        self.setAlignment(Qt.AlignCenter)
+        # Only plain positive decimals can be typed (the field is numeric by design).
+        self.setValidator(QRegularExpressionValidator(QRegularExpression(r"^\d{0,6}(\.\d{0,3})?$"), self))
+        self.setStyleSheet(
+            "QLineEdit { background: #ffffff; color: #000000; border: 1.5px solid #90AF13;"
+            " border-radius: 3px; font: 9pt 'Arial'; padding: 0px 2px;"
+            " selection-background-color: #90AF13; selection-color: #ffffff; }"
+        )
+        self.hide()
+
+    def start(self, key: str, text: str, anchor: QRectF, tooltip: str = "") -> None:
+        """Show the editor on top of ``anchor`` (the painted label's rectangle)."""
+        self._key = key
+        self._active = True
+        self.setText(text)
+        self.setToolTip(tooltip)
+
+        width = max(80, int(anchor.width()) + 12)
+        height = max(24, int(anchor.height()) + 6)
+        bounds = self.parentWidget().rect()
+        x = int(anchor.center().x() - width / 2)
+        y = int(anchor.center().y() - height / 2)
+        x = max(0, min(x, bounds.width() - width))
+        y = max(0, min(y, bounds.height() - height))
+
+        self.setGeometry(x, y, width, height)
+        self.show()
+        self.raise_()
+        self.setFocus(Qt.OtherFocusReason)
+        self.selectAll()
+
+    def cancel(self) -> None:
+        """Close the editor without applying anything (no-op when it is not open)."""
+        self._finish(commit=False)
+
+    def _finish(self, commit: bool) -> None:
+        if not self._active:      # guards against Enter + focus-out firing twice
+            return
+        self._active = False
+        key, text = self._key, self.text().strip()
+        self.hide()
+        if commit and text:
+            self.committed.emit(key, text)
+        else:
+            self.cancelled.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._finish(commit=True)
+        elif event.key() == Qt.Key_Escape:
+            self._finish(commit=False)
+        else:
+            super().keyPressEvent(event)
+
+    def focusOutEvent(self, event):
+        # Switching windows or opening the context menu must not commit a half-typed value.
+        if event.reason() in (Qt.ActiveWindowFocusReason, Qt.PopupFocusReason):
+            super().focusOutEvent(event)
+            return
+        super().focusOutEvent(event)
+        self._finish(commit=True)
+
+
+class CADLabelEditMixin:
+    """Double-click editing of painted dimension labels. List it *before* QWidget in the bases.
+
+    The host widget provides:
+        label_edited         = Signal(str, str)   # (KEY_*, typed text), emitted after a commit
+        CAD_EDITABLE_LABELS  = {KEY_*: (params_name, divisor, "Label", "unit")}
+        CAD_LOCKED_LABELS    = {KEY_*: "Label"}   # derived values - shown as read-only
+    and paints each interesting label through ``draw_text_with_background(..., edit_key=KEY_*)``,
+    which calls :meth:`_record_label_zone` so a double-click can be mapped back to its parameter.
+    """
+
+    CAD_EDITABLE_LABELS: dict = {}
+    CAD_LOCKED_LABELS: dict = {}
+
+    def _init_label_editing(self) -> None:
+        self.label_editing_enabled = False   # switched on only for the main-page canvases
+        self.label_edit_zones = []           # [(QRectF, KEY_*)] rebuilt on every paint
+        self._label_hover_key = None
+        self._label_editor = CADLabelEditor(self)
+        self._label_editor.committed.connect(self.label_edited)
+
+    # -- hit zones -------------------------------------------------------------------
+    def _record_label_zone(self, rect: QRectF, key: str) -> None:
+        self.label_edit_zones.append((QRectF(rect), key))
+
+    def _label_zone_at(self, pos):
+        for rect, key in reversed(self.label_edit_zones):
+            if rect.adjusted(-3, -3, 3, 3).contains(pos):
+                return rect, key
+        return None
+
+    def _locked_hint(self, key: str) -> str:
+        return (f"{self.CAD_LOCKED_LABELS[key]} is a derived value and is read-only. "
+                f"Edit the values it is derived from instead.")
+
+    # -- hover feedback --------------------------------------------------------------
+    def _update_label_hover(self, pos) -> None:
+        if not getattr(self, "label_editing_enabled", False):
+            return
+        hit = self._label_zone_at(pos)
+        key = hit[1] if hit else None
+        if key == self._label_hover_key:
+            return
+        self._label_hover_key = key
+        if key in self.CAD_EDITABLE_LABELS:
+            self.setCursor(pointing_hand_cursor())
+            label, unit = self.CAD_EDITABLE_LABELS[key][2:4]
+            QToolTip.showText(self.mapToGlobal(pos.toPoint()), f"Double-click to edit {label} ({unit})", self)
+        elif key in self.CAD_LOCKED_LABELS:
+            self.setCursor(Qt.ForbiddenCursor)
+            QToolTip.showText(self.mapToGlobal(pos.toPoint()), self._locked_hint(key), self)
+        else:
+            self.unsetCursor()
+            QToolTip.hideText()
+
+    # -- editing ---------------------------------------------------------------------
+    def mouseDoubleClickEvent(self, event):
+        if getattr(self, "label_editing_enabled", False) and event.button() == Qt.LeftButton:
+            hit = self._label_zone_at(event.position())
+            if hit is not None:
+                rect, key = hit
+                if key in self.CAD_EDITABLE_LABELS:
+                    self._begin_label_edit(rect, key)
+                    event.accept()
+                    return
+                if key in self.CAD_LOCKED_LABELS:
+                    QToolTip.showText(event.globalPosition().toPoint(), self._locked_hint(key), self)
+                    event.accept()
+                    return
+        super().mouseDoubleClickEvent(event)
+
+    def _begin_label_edit(self, rect: QRectF, key: str) -> None:
+        param, divisor, label, unit = self.CAD_EDITABLE_LABELS[key]
+        value = self.params.get(param)
+        text = "" if value is None else f"{float(value) / divisor:.3f}".rstrip("0").rstrip(".")
+        self._label_editor.start(key, text, rect, f"{label} ({unit}) - Enter to apply, Esc to cancel")
+
+    def _cancel_label_edit(self) -> None:
+        self._label_editor.cancel()
+
 
 #---------Standalone-Testing------------------------------------
 import sys
